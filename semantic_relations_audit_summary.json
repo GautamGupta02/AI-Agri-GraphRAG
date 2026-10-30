@@ -1,0 +1,30 @@
+{
+  "input_file": "C:\\Users\\gauta\\AI_Agri_GraphRAG\\processed\\graph_normalized\\relation_candidates_normalized.jsonl",
+  "total_semantic_relations": 16373,
+  "invalid_json_lines": 0,
+  "relation_counts": {
+    "ATTACKED_BY": 490,
+    "AFFECTED_BY": 234,
+    "HAS_SYMPTOM": 15560,
+    "MANAGED_BY": 89
+  },
+  "audit_category_counts": {
+    "ATTACKED_BY::PLAUSIBLE": 297,
+    "ATTACKED_BY::SAME_NAME_SUSPICIOUS": 107,
+    "AFFECTED_BY::TARGET_UNCERTAIN_TEXT": 12,
+    "ATTACKED_BY::SOURCE_MAY_BE_PEST": 45,
+    "ATTACKED_BY::TARGET_UNCERTAIN_TEXT": 41,
+    "AFFECTED_BY::PLAUSIBLE": 206,
+    "AFFECTED_BY::BROAD_OR_ABIOTIC_ISSUE": 16,
+    "HAS_SYMPTOM::PLAUSIBLE": 421,
+    "MANAGED_BY::PLAUSIBLE": 89,
+    "HAS_SYMPTOM::VALID_EVIDENCE_RELATION": 15139
+  },
+  "suspicious_relation_count": 221,
+  "suspicious_categories": [
+    "BROAD_OR_ABIOTIC_ISSUE",
+    "SAME_NAME_SUSPICIOUS",
+    "SOURCE_MAY_BE_PEST",
+    "TARGET_UNCERTAIN_TEXT"
+  ]
+}

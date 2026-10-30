@@ -1,0 +1,16 @@
+{
+  "input_file": "C:\\Users\\gauta\\AI_Agri_GraphRAG\\processed\\graph_normalized\\entity_occurrences_normalized.jsonl",
+  "total_normalized_records_scanned": 137062,
+  "agmmu_image_cases": 45094,
+  "agmmu_cases_with_images": 44847,
+  "agmmu_cases_without_images": 247,
+  "unique_image_references": 44847,
+  "image_count_distribution": {
+    "0": 247,
+    "1": 44847
+  },
+  "sources": {
+    "AgMMU": 45094
+  },
+  "output_manifest": "C:\\Users\\gauta\\AI_Agri_GraphRAG\\processed\\image_manifest\\agmmu_image_manifest.jsonl"
+}
