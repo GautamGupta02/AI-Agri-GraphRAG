@@ -1,0 +1,1033 @@
+# ============================================================
+# query_understanding.py
+# ============================================================
+#
+# Multimodal Query Understanding for Agriculture GraphRAG
+#
+# Purpose:
+#   Convert an evaluation image + question into structured,
+#   visually grounded evidence for GraphRAG retrieval.
+#
+# IMPORTANT:
+#   This module does NOT diagnose the disease/pest.
+#   It only extracts observable evidence.
+#
+# Pipeline:
+#
+#   Image + Question
+#          ↓
+#      Qwen3-VL
+#          ↓
+#   Visual Evidence
+#          ↓
+#   Structured JSON
+#          ↓
+#   GraphRAG Retrieval
+#
+# ============================================================
+
+
+import json
+import re
+
+import torch
+
+from PIL import Image
+
+from transformers import (
+    Qwen3VLForConditionalGeneration,
+    AutoProcessor,
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_PATH = (
+    "/content/drive/MyDrive/AI_Agri_GraphRAG/models/Qwen3-VL-8B-Instruct"
+    "Qwen3-VL-8B-Instruct"
+)
+
+
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+
+# ============================================================
+# BASE VISUAL EVIDENCE INSTRUCTION
+# ============================================================
+
+BASE_INSTRUCTION = """
+You are the visual evidence extraction module of an
+agricultural retrieval system.
+
+Your task is to inspect the provided agricultural image and
+extract ONLY visually supported evidence that can help retrieve
+relevant agricultural knowledge.
+
+You are NOT the final diagnostician.
+
+Do NOT guess the final disease.
+
+Do NOT guess the final pest.
+
+Do NOT invent symptoms.
+
+Do NOT invent damage.
+
+Do NOT provide treatment advice.
+
+Do NOT provide a final diagnosis.
+
+Your job is to describe what is actually visible in the image
+in a structured and retrieval-friendly form.
+
+IMPORTANT VISUAL REASONING RULES:
+
+1. Inspect the image carefully before answering.
+
+2. Prefer concrete visible observations over generic descriptions.
+
+3. Distinguish between:
+   - what is directly visible,
+   - what is strongly supported by visible evidence,
+   - and what is unknown.
+
+4. Never convert an uncertain observation into a definite
+   disease or pest identification.
+
+5. A pest does NOT need to be directly visible. If damage
+   characteristic of pest activity is clearly visible, describe
+   the damage without naming the pest.
+
+6. If an insect is visible, describe its observable appearance,
+   location, size relative to the plant, body shape, color,
+   wings, legs, clustering, or feeding position when visible.
+
+7. For plant damage, inspect carefully for:
+   - holes
+   - bore holes
+   - tunnels
+   - galleries
+   - chewing
+   - missing tissue
+   - bark removal
+   - cracks
+   - wounds
+   - scars
+   - lesions
+   - spots
+   - necrotic tissue
+   - discoloration
+   - wilting
+   - deformation
+   - swelling
+   - galls
+   - resin
+   - pitch
+   - sap
+   - frass
+   - sawdust
+   - webbing
+   - eggs
+   - larvae
+   - feeding marks
+   - exit holes
+   - unusual growth
+
+8. Pay attention to WHERE the damage occurs:
+   - leaf surface
+   - leaf margin
+   - leaf underside
+   - needle
+   - stem
+   - branch
+   - trunk
+   - bark
+   - fruit
+   - flower
+   - root
+   - crown
+   - other plant part
+
+9. Pay attention to the PATTERN of damage:
+   - isolated
+   - clustered
+   - scattered
+   - linear
+   - circular
+   - irregular
+   - repeated
+   - localized
+   - widespread
+
+10. Pay attention to visible color and texture changes.
+
+11. Do not assume that every visible mark is a symptom.
+    Describe ambiguous structures as ambiguous.
+
+12. Environmental context can be recorded, but it should not
+    dominate retrieval terms when stronger plant-damage evidence
+    is visible.
+
+13. Retrieval terms must be derived from observed evidence.
+    They may combine multiple observed characteristics.
+
+For example, if the image visibly contains:
+- a conifer trunk,
+- circular holes,
+- and sawdust,
+
+then retrieval terms may contain phrases such as:
+- conifer trunk holes
+- bark boring damage
+- sawdust around trunk holes
+- insect boring damage
+
+ONLY if those features are actually visible.
+
+Do NOT add a pest name merely because the combination resembles
+a known pest.
+
+Use concise phrases.
+
+Return ONLY valid JSON.
+"""
+
+
+# ============================================================
+# QUESTION-SPECIFIC FOCUS
+# ============================================================
+
+QUESTION_FOCUS = {
+
+    "insect/pest": """
+For this question, prioritize evidence useful for identifying
+an insect or pest.
+
+Carefully inspect:
+
+- host plant or tree
+- plant part affected
+- visible insect, if present
+- insect location
+- insect morphology
+- feeding position
+- holes
+- bore holes
+- tunnels
+- galleries
+- bark injury
+- chewing
+- missing tissue
+- frass
+- sawdust
+- pitch
+- resin
+- sap
+- webbing
+- eggs
+- larvae
+- exit holes
+- wilted or discolored plant parts
+- needle damage
+- leaf damage
+- branch or trunk damage
+- spatial distribution of damage
+
+Do NOT name the pest unless the question requires an
+observation of an explicitly visible insect and the name is
+directly supported. Prefer observable descriptions.
+""",
+
+
+    "disease/issue identification": """
+For this question, prioritize visible evidence useful for
+disease or plant-issue retrieval.
+
+Carefully inspect:
+
+- host/crop
+- affected plant part
+- lesions
+- spots
+- discoloration
+- chlorosis
+- necrosis
+- wilting
+- tissue death
+- deformation
+- swelling
+- galls
+- fungal-like growth
+- bacterial-like surface changes
+- mold-like structures
+- texture changes
+- lesion shape
+- lesion color
+- lesion boundaries
+- symptom distribution
+- repeated symptom patterns
+
+Do not name a disease merely from a generic visual resemblance.
+""",
+
+
+    "symptom/visual description": """
+For this question, prioritize detailed visual description.
+
+Inspect:
+
+- host/crop
+- plant part
+- color
+- texture
+- shape
+- size
+- surface appearance
+- lesions
+- spots
+- holes
+- wounds
+- discoloration
+- deformation
+- damage pattern
+- spatial distribution
+- unusual structures
+
+Do not infer an underlying disease or pest unless it is directly
+and visually identifiable.
+""",
+
+
+    "species": """
+For this question, prioritize visible characteristics useful
+for identifying the host or crop.
+
+Inspect:
+
+- plant growth form
+- leaf characteristics
+- needle characteristics
+- bark
+- stem
+- branches
+- fruit
+- flower
+- visible morphology
+- shape
+- arrangement
+- texture
+- distinctive structural characteristics
+
+Do not force a species identification when the image does not
+support it.
+""",
+
+
+    "management instructions": """
+For this question, extract the visible condition that could be
+useful for later management retrieval.
+
+Focus on:
+
+- host/crop
+- affected plant part
+- visible damage
+- visible symptoms
+- visible pest evidence
+- visible disease-related evidence
+- damage severity if visually apparent
+- distribution of damage
+- important environmental context
+
+Do NOT provide management advice yourself.
+"""
+}
+
+
+# ============================================================
+# JSON CLEANING
+# ============================================================
+
+def clean_json_text(text):
+    """
+    Remove common markdown wrappers around JSON.
+    """
+
+    if text is None:
+        return ""
+
+    text = text.strip()
+
+    # Remove markdown code fence.
+    if text.startswith("```"):
+
+        text = re.sub(
+            r"^```(?:json)?",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        text = re.sub(
+            r"```$",
+            "",
+            text
+        )
+
+    return text.strip()
+
+
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
+
+def extract_json(text):
+    """
+    Robustly extract the first JSON object from model output.
+    """
+
+    text = clean_json_text(text)
+
+    # --------------------------------------------------------
+    # Direct JSON parsing
+    # --------------------------------------------------------
+
+    try:
+
+        return json.loads(text)
+
+    except Exception:
+
+        pass
+
+
+    # --------------------------------------------------------
+    # Extract JSON object from surrounding text
+    # --------------------------------------------------------
+
+    start = text.find("{")
+
+    end = text.rfind("}")
+
+
+    if (
+        start != -1
+        and end != -1
+        and end > start
+    ):
+
+        candidate = text[
+            start:end + 1
+        ]
+
+
+        try:
+
+            return json.loads(
+                candidate
+            )
+
+        except Exception:
+
+            pass
+
+
+    return None
+
+
+# ============================================================
+# NORMALIZE LIST FIELD
+# ============================================================
+
+def normalize_list_field(
+    value
+):
+    """
+    Ensure every structured field is a list of concise strings.
+    """
+
+    if value is None:
+
+        return []
+
+
+    if isinstance(
+        value,
+        str
+    ):
+
+        value = value.strip()
+
+        if not value:
+
+            return []
+
+        return [value]
+
+
+    if isinstance(
+        value,
+        list
+    ):
+
+        result = []
+
+        for item in value:
+
+            item = str(
+                item
+            ).strip()
+
+            if item:
+
+                result.append(
+                    item
+                )
+
+        return result
+
+
+    return [
+        str(value).strip()
+    ]
+
+
+# ============================================================
+# NORMALIZE PARSED OUTPUT
+# ============================================================
+
+def normalize_output(
+    parsed
+):
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        return None
+
+
+    fields = [
+
+        "host_or_crop",
+
+        "plant_part",
+
+        "visible_damage",
+
+        "visible_symptoms",
+
+        "visual_features",
+
+        "insect_or_pest_observation",
+
+        "environmental_context",
+
+        "damage_location",
+
+        "damage_pattern",
+
+        "visible_color_changes",
+
+        "retrieval_terms",
+    ]
+
+
+    normalized = {}
+
+
+    for field in fields:
+
+        normalized[field] = (
+            normalize_list_field(
+                parsed.get(
+                    field,
+                    []
+                )
+            )
+        )
+
+
+    return normalized
+
+
+# ============================================================
+# BUILD QUESTION-AWARE PROMPT
+# ============================================================
+
+def build_prompt(
+    question,
+    qtype=None,
+    background="",
+    options=""
+):
+
+    qtype_key = str(
+        qtype
+        if qtype is not None
+        else ""
+    ).strip().lower()
+
+
+    focus = QUESTION_FOCUS.get(
+        qtype_key,
+        """
+Focus on the most visually relevant plant characteristics,
+symptoms, damage, and contextual evidence needed for retrieval.
+"""
+    )
+
+
+    prompt = f"""
+{BASE_INSTRUCTION}
+
+
+============================================================
+QUESTION
+============================================================
+
+{question}
+
+
+============================================================
+QUESTION TYPE
+============================================================
+
+{qtype}
+
+
+============================================================
+BACKGROUND
+============================================================
+
+{background}
+
+
+============================================================
+OPTIONS
+============================================================
+
+{options}
+
+
+============================================================
+QUESTION-SPECIFIC VISUAL FOCUS
+============================================================
+
+{focus}
+
+
+============================================================
+OUTPUT FORMAT
+============================================================
+
+Return exactly one JSON object with these fields:
+
+{{
+  "host_or_crop": [],
+  "plant_part": [],
+  "visible_damage": [],
+  "visible_symptoms": [],
+  "visual_features": [],
+  "insect_or_pest_observation": [],
+  "environmental_context": [],
+  "damage_location": [],
+  "damage_pattern": [],
+  "visible_color_changes": [],
+  "retrieval_terms": []
+}}
+
+
+============================================================
+FIELD DEFINITIONS
+============================================================
+
+host_or_crop:
+Describe the visible host, crop, plant, or broad plant category.
+
+Do not force an exact species if it is not visually supported.
+
+
+plant_part:
+Identify the visible or affected plant parts.
+
+Examples:
+- leaf
+- needle
+- stem
+- branch
+- trunk
+- bark
+- fruit
+- flower
+- root
+- crown
+
+
+visible_damage:
+Describe ONLY damage that can actually be seen.
+
+Examples:
+- holes in bark
+- missing leaf tissue
+- chewing marks
+- bark injury
+- bore holes
+- cracks
+- wounds
+- tunnels
+- webbing
+- pitch masses
+- resin
+- sawdust
+- frass
+
+Do not add an item simply because it is common for a suspected
+pest.
+
+
+visible_symptoms:
+Describe observable symptoms or plant condition.
+
+Examples:
+- yellowing
+- browning
+- wilting
+- necrotic tissue
+- spots
+- lesions
+- deformation
+- dieback
+
+
+visual_features:
+Describe useful visual characteristics that are not necessarily
+damage.
+
+Examples:
+- bark texture
+- needle arrangement
+- leaf shape
+- visible insect shape
+- surface texture
+- plant growth form
+
+
+insect_or_pest_observation:
+Describe only what can be observed about an insect or pest.
+
+If no insect is clearly visible, explicitly state:
+
+"no insect clearly visible"
+
+Do not guess the pest identity.
+
+
+environmental_context:
+Record useful visible context.
+
+Examples:
+- outdoor tree
+- field
+- greenhouse
+- soil visible
+- nearby structure
+- container
+- water
+
+
+damage_location:
+Describe where the damage occurs.
+
+Examples:
+- lower trunk
+- upper branches
+- leaf margins
+- leaf surface
+- needle tips
+- bark
+
+
+damage_pattern:
+Describe how the damage is distributed.
+
+Examples:
+- isolated
+- clustered
+- scattered
+- circular
+- linear
+- irregular
+- localized
+- widespread
+
+
+visible_color_changes:
+Record clearly visible color changes.
+
+Examples:
+- yellow needles
+- brown leaf tips
+- dark lesions
+- pale patches
+
+Do not interpret the cause of the color change.
+
+
+retrieval_terms:
+Create short retrieval phrases using ONLY the observations
+already recorded above.
+
+These phrases should combine multiple useful observations when
+possible.
+
+For example:
+
+Observed:
+- coniferous tree
+- trunk
+- holes in bark
+- sawdust around holes
+
+Good retrieval terms:
+
+- conifer trunk bark holes
+- tree boring damage
+- sawdust around bark holes
+- conifer insect boring
+
+Bad retrieval terms:
+
+- mountain pine beetle
+- spruce bark beetle
+- pitch mass borer
+
+unless that name is directly and unambiguously visible,
+which is generally not possible from plant damage alone.
+
+NEVER use guessed disease or pest names as retrieval terms.
+"""
+
+
+    return prompt
+
+
+# ============================================================
+# RUN QUERY UNDERSTANDING
+# ============================================================
+
+def run_query_understanding(
+    model,
+    processor,
+    image_path,
+    question,
+    qtype=None,
+    background="",
+    options=""
+):
+
+    # --------------------------------------------------------
+    # LOAD IMAGE
+    # --------------------------------------------------------
+
+    image = (
+        Image.open(
+            image_path
+        ).convert("RGB")
+    )
+
+
+    # --------------------------------------------------------
+    # BUILD PROMPT
+    # --------------------------------------------------------
+
+    prompt = build_prompt(
+
+        question=question,
+
+        qtype=qtype,
+
+        background=background,
+
+        options=options
+    )
+
+
+    # --------------------------------------------------------
+    # MULTIMODAL MESSAGE
+    # --------------------------------------------------------
+
+    messages = [
+
+        {
+            "role": "user",
+
+            "content": [
+
+                {
+                    "type": "image",
+
+                    "image": image
+                },
+
+                {
+                    "type": "text",
+
+                    "text": prompt
+                }
+            ]
+        }
+    ]
+
+
+    # --------------------------------------------------------
+    # CHAT TEMPLATE
+    # --------------------------------------------------------
+
+    text = (
+        processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # PROCESS INPUT
+    # --------------------------------------------------------
+
+    inputs = processor(
+
+        text=[text],
+
+        images=[image],
+
+        return_tensors="pt"
+    )
+
+
+    # --------------------------------------------------------
+    # MOVE TENSORS TO MODEL DEVICE
+    # --------------------------------------------------------
+
+    inputs = {
+
+        key: value.to(
+            model.device
+        )
+        if hasattr(
+            value,
+            "to"
+        )
+        else value
+
+        for key, value
+        in inputs.items()
+    }
+
+
+    # --------------------------------------------------------
+    # GENERATE
+    # --------------------------------------------------------
+
+    with torch.inference_mode():
+
+        generated_ids = (
+            model.generate(
+
+                **inputs,
+
+                max_new_tokens=600,
+
+                do_sample=False
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # REMOVE INPUT TOKENS
+    # --------------------------------------------------------
+
+    input_len = (
+        inputs[
+            "input_ids"
+        ].shape[1]
+    )
+
+
+    generated_ids = (
+        generated_ids[
+            :,
+            input_len:
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # DECODE
+    # --------------------------------------------------------
+
+    output_text = (
+        processor.batch_decode(
+
+            generated_ids,
+
+            skip_special_tokens=True
+        )[0]
+    )
+
+
+    # --------------------------------------------------------
+    # PARSE JSON
+    # --------------------------------------------------------
+
+    parsed = extract_json(
+        output_text
+    )
+
+
+    # --------------------------------------------------------
+    # NORMALIZE JSON
+    # --------------------------------------------------------
+
+    normalized = (
+        normalize_output(
+            parsed
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # RETURN
+    # --------------------------------------------------------
+
+    return {
+
+        "raw_output":
+            output_text,
+
+        "parsed":
+            normalized,
+
+        "prompt":
+            prompt
+    }
+
+
+# ============================================================
+# SIMPLE LOCAL TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "query_understanding.py loaded successfully."
+    )
